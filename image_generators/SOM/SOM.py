@@ -1,19 +1,7 @@
 import numpy as np
-import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-def highlight_cell(x, y, ax=None, **kwargs):
-    """
-    Highlights a cell in a grid by drawing a rectangle around it.
-    """
-    rect = plt.Rectangle((x-0.5, y-0.5), 1, 1, fill=False, **kwargs)
-    ax = ax or plt.gca()
-    ax.add_patch(rect)
-    return rect
-
 
 class SOM(nn.Module):
     """
@@ -21,7 +9,7 @@ class SOM(nn.Module):
     and linearly decreasing learning rate.
     """
     
-    def __init__(self, m, n, dim, n_iter, alpha=None, sigma=None, toroidal=False, dist_metric="euclidean"):
+    def __init__(self, m, n, dim, decay, alpha=None, sigma=None, toroidal=False, dist_metric="euclidean"):
         """
         Initializes all necessary components of the TensorFlow
         Graph.
@@ -42,7 +30,7 @@ class SOM(nn.Module):
         self.m = m
         self.n = n
         self.dim = dim
-        self.n_iter = n_iter
+        self.decay = decay
         if alpha == None:
             self.alpha = 0.3
         else:
@@ -53,14 +41,12 @@ class SOM(nn.Module):
             self.sigma = sigma
         self.toroidal = toroidal
         self.dist_metric = dist_metric
-        self.t = 0 # Increase by one every forward call.
-        self.frames = []
+        self.step = 0 
         
         # Initialise the weight matrix TODO:  INITIALISE WEIGHTS BASED ON TRAINING DATA
-        self.weights = torch.FloatTensor(m*n, dim).uniform_(0.25, 1)
+        self.weights = torch.FloatTensor(m*n, dim).uniform_(0, 1)
         arr = np.array([i.ravel() for i in np.meshgrid(np.arange(self.m), np.arange(self.n))])
         self.x, self.y = torch.from_numpy(arr).long()
-        #self.x, self.y = torch.LongTensor([i.ravel() for i in np.meshgrid(np.arange(self.m), np.arange(self.n))])
         self.locations = torch.LongTensor(np.column_stack((self.x, self.y)))
         
         self.dist_metric = dist_metric
@@ -79,7 +65,7 @@ class SOM(nn.Module):
         return self.locations
     
     
-    def get_bmu(self, x):
+    def get_bmu(self, x, return_dist=False):
         """
         Calculates the best matching unit for a given input vector.
         Input: x, a 1-D Tensor of shape [dim].
@@ -91,15 +77,51 @@ class SOM(nn.Module):
         
         # Find neuron with minimum distance from input vector as BMU.
         if self.dist_metric == "cosine":
-            _, bmu = torch.max(dists, 0)
+            dist, bmu = torch.max(dists, 0)
             
         else:
-            _, bmu = torch.min(dists, 0)
+            dist, bmu = torch.min(dists, 0)
         
         # Get the grid location of BMU.
         bmu_loc = self.locations[bmu,:]
         
-        return bmu, bmu_loc
+        # For calculating average distance metrics
+        if return_dist:
+            return dist
+        else:
+            return bmu, bmu_loc
+    
+    
+    
+    def get_avg_bmu_dist(self, vectors):
+        cum_dist = 0
+        for vector in vectors:
+            dist = self.get_bmu(vector, return_dist=True)
+            cum_dist += dist
+        return cum_dist/vectors.shape[0]
+    
+    
+    def get_bmus(self, vectors):
+        """
+        Computes the BMU locations for all input vectors and returns them as a 2D NumPy array.
+        """
+        bmus = np.zeros((len(vectors), 2)) 
+        for idx, vector in enumerate(vectors):
+            _, loc = self.get_bmu(vector)
+            bmus[idx] = loc.numpy()
+        return bmus
+            
+    
+    def get_bmu_changes(self, vectors, prev_bmu_list):
+        """
+        Compares the current BMU locations with the previous BMU list.
+        Returns the updated BMU list and the count of changes.
+        """
+        current_bmus = self.get_bmus(vectors)
+        # Compare current BMUs with previous BMUs
+        changes = np.sum(~np.all(current_bmus == prev_bmu_list, axis=1))
+        return current_bmus, changes
+        
 
 
 
@@ -112,7 +134,7 @@ class SOM(nn.Module):
         length = len(locations)
         
         if self.toroidal:
-            # Calculatiung toroidal distance between each nueron and the bmu
+            # Calculatiung toroidal distance between each neuron and the bmu
             dx = abs(self.x - bmu_loc[0])
             dy = abs(self.y - bmu_loc[1])
             dx[dx > self.m/2] -= self.m
@@ -140,92 +162,20 @@ class SOM(nn.Module):
         new_weights = torch.add(weights, delta)
         
         return new_weights
-
+    
+    
 
 
     ### Learning
-    def forward(self, x, it, GIF=False):
+    def forward(self, x):
         
-        _, bmu_loc = self.get_bmu(x)
+        bmu, bmu_loc = self.get_bmu(x)
     
-        # Calculate the learning rate and neighbourhood radius
-        learning_rate = 1 - it/self.n_iter
-        alpha_op = self.alpha * learning_rate
-        sigma_op = self.sigma * learning_rate
-        
+        alpha_op = self.alpha * (self.decay**self.step)
+        sigma_op = self.sigma * (self.decay**self.step)
+
         # Update weights
         self.weights = self.update_weights(self.locations, self.weights, bmu_loc, x, alpha_op, sigma_op)
-                
-        self.t += 1
         
-
+        self.step += 1
     
-    ### Visualisations
-    def plot_locations(self, m, n, x, bmu_loc, alpha_op, sigma_op, ax):
-        """ 
-        Plots locations of neurons. Highlights the BMU, and colours by adjusted weights toward the BMU. 
-        Only works if dim of neurons = 3 (RGB) values between 0 and 1.
-        """
-        
-        centroid_grid = np.zeros((m, n, 3))
-        centroid_weights = torch.Tensor([0.8]*3*self.m*self.n).reshape(self.m*self.n, 3)
-        
-        locations = self.get_location()
-        centroid_weights = self.update_weights(locations, centroid_weights, bmu_loc, x, alpha_op, sigma_op)
-        
-        for i, loc in enumerate(locations):
-            centroid_grid[loc[0]][loc[1]] = centroid_weights[i]
-
-        
-        linewidth=2
-        ax.imshow(centroid_grid)
-        ax.set_xticks(np.arange(0, n, 1))
-        ax.set_yticks(np.arange(0, m, 1))
-        ax.set_xticks(np.arange(-.5, n, 1), minor=True)
-        ax.set_yticks(np.arange(-.5, m, 1), minor=True)
-        ax.set_xlabel("x")
-        ax.set_ylabel("y")
-        highlight_cell(bmu_loc[1], bmu_loc[0], ax=ax, color='black', linewidth=linewidth)
-
-        ax.grid(which='minor', color='w', linestyle='-', linewidth=linewidth)
-        for i, (x, y) in enumerate(self.locations):
-            ax.text(y, x, str(i), color='black', ha='center', va='center', fontsize=m/(m/6))
-        ax.tick_params(which='minor', bottom=False, left=False)
-        ax.set_axisbelow(True)
-        ax.set_title(f"BMU")
-
-    
-    
-    def plot_som(self, m, n, ax, vectors=[]):
-        """ 
-        Plots the grid of neuron weights. 
-        Only works if dim of neurons = 3 (RGB) values between 0 and 1.
-        """
-        
-        centroid_grid = np.zeros((m, n, 3))
-        weights = self.get_weights()
-        locations = self.get_location()
-        for i, loc in enumerate(locations):
-            centroid_grid[loc[0]][loc[1]] = weights[i].numpy()
-        
-        ax.imshow(centroid_grid)
-        ax.set_xticks(np.arange(0, n, 1))
-        ax.set_yticks(np.arange(0, m, 1))
-        ax.set_xlabel("x")
-        ax.set_ylabel("y")
-        ax.set_title(f"SOM")
-        for vector in vectors:
-            _, loc = self.get_bmu(vector)
-            highlight_cell(loc[1], loc[0], ax=ax, color='black', linewidth=2)
-
-
-m = 40
-n = 40
-dim = 3
-n_iter = 100
-
-
-
-som = SOM(m, n, dim, n_iter, alpha=.8, sigma=12)
-
-som.forward(torch.FloatTensor(3).uniform_(.25, 1), 0)
