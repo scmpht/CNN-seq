@@ -7,6 +7,7 @@ class SOM(nn.Module):
     """
     2-D Self-Organizing Map with Gaussian Neighbourhood function
     and linearly decreasing learning rate.
+    Input for training data should be examples x dimension i.e. a SOM for gene clustering, would be #genes x #samples.
     """
     
     def __init__(self, m, n, dim, decay, alpha=None, sigma=None, toroidal=False, dist_metric="euclidean"):
@@ -44,7 +45,7 @@ class SOM(nn.Module):
         self.step = 0 
         
         # Initialise the weight matrix TODO:  INITIALISE WEIGHTS BASED ON TRAINING DATA
-        self.weights = torch.FloatTensor(m*n, dim).uniform_(0, 1)
+        self.weights = torch.FloatTensor(m*n, dim).uniform_(-1, 1)
         arr = np.array([i.ravel() for i in np.meshgrid(np.arange(self.m), np.arange(self.n))])
         self.x, self.y = torch.from_numpy(arr).long()
         self.locations = torch.LongTensor(np.column_stack((self.x, self.y)))
@@ -64,118 +65,154 @@ class SOM(nn.Module):
     def get_location(self):
         return self.locations
     
-    
     def get_bmu(self, x, return_dist=False):
         """
-        Calculates the best matching unit for a given input vector.
-        Input: x, a 1-D Tensor of shape [dim].
-        Returns: bmu, the index of the best matching unit and bmu_loc, the grid location of the best matching unit.
+        Calculates the best matching unit for a given single input vector x.
         """
+        # shape: [M, D] vs [D] => we replicate x to shape [M, D]
+        dists = self.dist(torch.stack([x for _ in range(self.m*self.n)]), self.weights)
         
-        # Calculate pairwise-distance of data point x with all neurons. P-norm with p=2 is equivalent to euclidean distance.
-        dists = self.dist(torch.stack([x for i in range(self.m*self.n)]), self.weights)
-        
-        # Find neuron with minimum distance from input vector as BMU.
         if self.dist_metric == "cosine":
-            dist, bmu = torch.max(dists, 0)
-            
+            dist, bmu = torch.max(dists, 0)   # similarity => max
         else:
-            dist, bmu = torch.min(dists, 0)
+            dist, bmu = torch.min(dists, 0)   # distance => min
         
-        # Get the grid location of BMU.
-        bmu_loc = self.locations[bmu,:]
-        
-        # For calculating average distance metrics
         if return_dist:
             return dist
         else:
+            bmu_loc = self.locations[bmu, :]
             return bmu, bmu_loc
-    
-    
-    
-    def get_avg_bmu_dist(self, vectors):
-        cum_dist = 0
-        for vector in vectors:
-            dist = self.get_bmu(vector, return_dist=True)
-            cum_dist += dist
-        return cum_dist/vectors.shape[0]
-    
-    
+
+    # ----------------------------------------------------------------
+    # Vectorized BMU for entire batch
+    # ----------------------------------------------------------------
+    def get_bmus_batch(self, vectors):
+        """
+        Computes BMU indices and BMU locations for all input vectors at once.
+        vectors: shape [N, D]
+        returns: bmu_idx (shape: [N]), bmu_locs (shape: [N, 2])
+        """
+        # Expand shapes:
+        # weights: [M, D], vectors: [N, D]
+        # For Euclidean: compute pairwise distance in a vectorized way
+        if self.dist_metric == "euclidean":
+            # dist_matrix: shape [N, M]
+            # Strategy:  d(X, W)^2 = X^2 + W^2 - 2 XW^T  => then sqrt if needed
+            X_sq = (vectors**2).sum(dim=1, keepdim=True)      # [N, 1]
+            W_sq = (self.weights**2).sum(dim=1).unsqueeze(0)  # [1, M]
+            # XW^T: shape [N, M]
+            vectors = vectors.to(self.weights.dtype)
+            cross_term = 2 * vectors.matmul(self.weights.t())  # [N, M]
+            dist_matrix_sq = X_sq + W_sq - cross_term
+            dist_matrix_sq = torch.clamp(dist_matrix_sq, min=1e-9)  # avoid negatives
+            dist_matrix = torch.sqrt(dist_matrix_sq)  # [N, M]
+            
+            # BMU is min distance => argmin
+            bmu_idx = dist_matrix.argmin(dim=1)
+        
+        elif self.dist_metric == "cosine":
+            # Using dot-product-based approach for batch, or just use F.cosine_similarity
+            # But F.cosine_similarity expects [N, D], [N, D], so we do some broadcasting.
+            # Alternatively, do a manual approach:
+            #   cos_sim = (X · W) / (||X|| ||W||)
+            # for each pair in a batched manner
+            X_norm = F.normalize(vectors, dim=1)         # [N, D]
+            W_norm = F.normalize(self.weights, dim=1)    # [M, D]
+            # shape [N, M] => X_norm @ W_norm.T
+            sim_matrix = X_norm.matmul(W_norm.t())
+            # BMU is max similarity => argmax
+            bmu_idx = sim_matrix.argmax(dim=1)
+        
+        # Now map bmu_idx => bmu_locs
+        bmu_locs = self.locations[bmu_idx]  # shape: [N, 2]
+        return bmu_idx, bmu_locs
+
     def get_bmus(self, vectors):
         """
-        Computes the BMU locations for all input vectors and returns them as a 2D NumPy array.
+        Just return the BMU locations as a NumPy array [N, 2].
         """
-        bmus = np.zeros((len(vectors), 2)) 
-        for idx, vector in enumerate(vectors):
-            _, loc = self.get_bmu(vector)
-            bmus[idx] = loc.numpy()
-        return bmus
-            
+        _, bmu_locs = self.get_bmus_batch(vectors)
+        return bmu_locs.cpu().numpy()  # ensure it's a NumPy array
     
+    def get_avg_bmu_dist(self, vectors):
+        """
+        Compute average distance of each vector to its BMU in a vectorized way.
+        """
+        if self.dist_metric == "euclidean":
+            # Let’s reuse the partial steps from get_bmus_batch to compute distances
+            X_sq = (vectors**2).sum(dim=1, keepdim=True)      # [N, 1]
+            W_sq = (self.weights**2).sum(dim=1).unsqueeze(0)  # [1, M]
+            vectors = vectors.to(self.weights.dtype)
+            cross_term = 2 * vectors.matmul(self.weights.t())  # [N, M]
+            dist_matrix_sq = X_sq + W_sq - cross_term
+            dist_matrix_sq = torch.clamp(dist_matrix_sq, min=1e-9)
+            dist_matrix = torch.sqrt(dist_matrix_sq)  # [N, M]
+            
+            # For each row, get the min distance to a neuron
+            min_dist, _ = dist_matrix.min(dim=1)  # shape [N]
+            return min_dist.mean()                # scalar
+        else:
+            # Cosine => we want 1 - similarity if we treat "distance" as such
+            X_norm = F.normalize(vectors, dim=1)
+            W_norm = F.normalize(self.weights, dim=1)
+            sim_matrix = X_norm.matmul(W_norm.t())  # shape [N, M]
+            max_sim, _ = sim_matrix.max(dim=1)
+            # "Distance" can be (1 - similarity) or something else
+            # If you truly want an average distance metric, define it consistently:
+            avg_dist = (1.0 - max_sim).mean()
+            return avg_dist
+
     def get_bmu_changes(self, vectors, prev_bmu_list):
         """
-        Compares the current BMU locations with the previous BMU list.
-        Returns the updated BMU list and the count of changes.
+        Compare the current BMU locations with the previous BMU list
+        in a vectorized way.
         """
-        current_bmus = self.get_bmus(vectors)
-        # Compare current BMUs with previous BMUs
+        current_bmus = self.get_bmus(vectors)  # shape [N, 2], np.array
         changes = np.sum(~np.all(current_bmus == prev_bmu_list, axis=1))
         return current_bmus, changes
-        
-
-
-
-    def update_weights(self, locations, weights, bmu_loc, x, alpha_op, sigma_op):
+    
+    
+    
+    def update_weights(self, weights, bmu_loc, x, alpha_op, sigma_op):
         """
-        Calculates the new weights of the SOM.
+        Calculates the new weights of the SOM with optimized operations.
         """
-        
-        dim = len(x)
-        length = len(locations)
-        
+        # Calculate distances based on toroidal or non-toroidal grid
+        dx = self.x - bmu_loc[0]
+        dy = self.y - bmu_loc[1]
+
         if self.toroidal:
-            # Calculatiung toroidal distance between each neuron and the bmu
-            dx = abs(self.x - bmu_loc[0])
-            dy = abs(self.y - bmu_loc[1])
-            dx[dx > self.m/2] -= self.m
-            dy[dy > self.n/2] -= self.n
-            distances = torch.stack([dx, dy], 1)
-        
-        else:
-            # Non-toroidal distance calculation
-            dx = self.x - bmu_loc[0]
-            dy = self.y - bmu_loc[1]
-            distances = torch.stack([dx, dy], dim=1).float()
-        
-        # Calculating the neighbourhood function
-        square_distances = torch.pow(distances, 2) # Tensor of square of the distances, shape = (m*n, 2), dtype = int, e.g. [169, 1], ... [36, 324]
-        sum_square_distances = torch.sum(square_distances, 1) # Tensor of sum of x and y distances of each neuron to bmu, shape = [m*n], dtype = int, e.g [170, 37, 35, ...]
-        scaled_distances = torch.div(sum_square_distances, sigma_op**2) # Divide distances by neighbourhood radius squared, further distances have a higher number, shape = [m*n], dtype = float, e.g. [0.8500, 0.6800, 0.5300, ...]
-        negative_scaled_distances = torch.neg(scaled_distances) # Negative of the above neighborhood function, further neurons now have lower number  shape = [m*n], dtype = float, e.g. [-0.8500, -0.6800, -0.5300, ...]
-        neighbourhood_scalar = torch.exp(negative_scaled_distances) # Exponential of the scaled distances, since e^negative: will be between 0 and 1, with more negative closer to 0. shape = [m*n], dtype = float, e.g. [0.4300, 0.5100, 0.5900, ...]
-        
-        # Calculate the new weights
-        lr_scalar = alpha_op * neighbourhood_scalar # Learning rate multiplied by the neighbourhood function, shape = [m*n], dtype = float, e.g. [0.1290, 0.1530, 0.1770, ...]
-        match_dim_lr_scalars =  torch.stack([lr_scalar[i].repeat(dim) for i in range(length)]) # Necessary for mult; repeats the learning rate scalar for the dimensionality of the weights, shape = [m*n, dim], dtype = float, e.g. [0.1290, 0.1290, 0.1290], ... [0.1530, 0.1530, 0.1530], ...
-        data_weight_diff = x - weights # Tensor of the difference between the data point and the weights, shape = [m*n, dim], dtype = float, e.g. [0.1290, 0.1290, 0.1290], ... [0.1530, 0.1530, 0.1530], ...
-        delta = torch.mul(match_dim_lr_scalars, data_weight_diff) # Tensor multiplying the difference by the scalar. shape = [m*n, dim], dtype = float, e.g. [0.0852, 0.0518, 0.0238], ... [0.0382, 0.0852, 0.0518], ...
-        new_weights = torch.add(weights, delta)
-        
+            dx = torch.where(dx > self.m / 2, self.m - dx, dx)
+            dy = torch.where(dy > self.n / 2, self.n - dy, dy)
+
+        # Compute squared Euclidean distance
+        distances = dx**2 + dy**2  # Shape: [m*n], squaring removes the sign here.
+
+        # Neighborhood function (Gaussian)
+        neighbourhood_scalar = torch.exp(-distances / (2 * sigma_op**2))  # Shape: [m*n]
+
+        # Scale the learning rate by the neighborhood function
+        lr_scalar = alpha_op * neighbourhood_scalar  # Shape: [m*n]
+
+        # Compute weight updates in a single step
+        delta = lr_scalar[:, None] * (x - weights)  # Broadcasting scalar to match dimensions
+
+        # Update weights
+        new_weights = weights + delta
+
         return new_weights
-    
-    
+
 
 
     ### Learning
-    def forward(self, x):
+    def forward(self, x, step):
         
-        bmu, bmu_loc = self.get_bmu(x)
+        _, bmu_loc = self.get_bmu(x)
+
     
-        alpha_op = self.alpha * (self.decay**self.step)
-        sigma_op = self.sigma * (self.decay**self.step)
+        alpha_op = self.alpha * (self.decay**step)
+        sigma_op = self.sigma * (self.decay**step)
 
         # Update weights
         self.weights = self.update_weights(self.locations, self.weights, bmu_loc, x, alpha_op, sigma_op)
-        
-        self.step += 1
     
